@@ -2,6 +2,7 @@
 
 // 状態管理
 const STORAGE_KEY = "daifugo-table-stats-v1";
+const DEBUG_ENABLED = new URLSearchParams(location.search).get("debug") === "1";
 const SUITS = ["♠", "♥", "♦", "♣"];
 const RANKS = [
   { label: "3", value: 3 },
@@ -32,6 +33,8 @@ const gameState = {
   currentPlayerIndex: 0,
   currentField: null,
   playedCards: [],
+  jBack: false,
+  fieldEffect: "",
   lastPlayedBy: null,
   selectedCardIds: new Set(),
   ranking: [],
@@ -53,6 +56,7 @@ document.addEventListener("DOMContentLoaded", initApp);
 // 初期化
 function initApp() {
   cacheElements();
+  document.body.classList.toggle("debug-enabled", DEBUG_ENABLED);
   gameState.stats = loadStats();
   gameState.cpuSpeed = gameState.stats.cpuSpeed || "normal";
   bindEvents();
@@ -66,7 +70,7 @@ function cacheElements() {
     "titleScreen", "gameScreen", "startButton", "resetStatsButton", "statsList",
     "roundNumber", "stateTitle", "skipDealButton", "backTitleButton",
     "playersArea", "turnBanner", "fieldType", "lastMove", "fieldCards",
-    "dealAnimationLayer", "logList", "exchangePanel", "exchangeInfo",
+    "fieldEffect", "dealAnimationLayer", "logList", "exchangePanel", "exchangeInfo",
     "exchangeGiven", "exchangeButton", "handPanel", "selectionStatus",
     "illegalReason", "playerHand", "playButton", "passButton",
     "clearSelectionButton", "resultPanel", "resultList", "nextRoundButton",
@@ -143,6 +147,8 @@ function startRound() {
   gameState.selectedCardIds.clear();
   gameState.currentField = null;
   gameState.playedCards = [];
+  gameState.jBack = false;
+  gameState.fieldEffect = "";
   gameState.lastPlayedBy = null;
   gameState.ranking = [];
   gameState.exchange = null;
@@ -240,7 +246,7 @@ function getLegalMoves(player, state = gameState) {
       }
     });
   });
-  return moves.sort((a, b) => a.count - b.count || a.value - b.value);
+  return moves.sort((a, b) => a.count - b.count || cardPower(a.value) - cardPower(b.value));
 }
 
 function compareMove(move, currentField) {
@@ -248,10 +254,16 @@ function compareMove(move, currentField) {
   if (move.count !== currentField.count) {
     return { ok: false, reason: `現在の場は${currentField.label}です` };
   }
-  if (move.value <= currentField.value) {
+  const movePower = cardPower(move.value);
+  const fieldPower = cardPower(currentField.value);
+  if (movePower <= fieldPower) {
     return { ok: false, reason: "場のカードより強いカードを出してください" };
   }
   return { ok: true };
+}
+
+function cardPower(value) {
+  return gameState.jBack ? 18 - value : value;
 }
 
 function groupByValue(cards) {
@@ -321,9 +333,10 @@ function handlePlayerPlay() {
     renderHand();
     return;
   }
-  applyMove(player, legality.move);
+  const result = applyMove(player, legality.move);
   gameState.selectedCardIds.clear();
   render();
+  if (result.fieldCleared) return;
   delay(520).then(nextTurn);
 }
 
@@ -360,13 +373,18 @@ function handleCpuTurn() {
         player.passed = true;
         addLog(`${player.name} がパスしました`);
       } else {
-        applyMove(player, move);
+        const result = applyMove(player, move);
+        if (result.fieldCleared) {
+          render();
+          return "fieldCleared";
+        }
       }
     }
     render();
     return delay(Math.min(650, wait * 0.55));
   }).then(() => {
     if (token !== gameState.actionToken) return;
+    if (gameState.phase === "fieldClear") return;
     nextTurn();
   });
 }
@@ -379,26 +397,8 @@ function clearFieldIfNeeded() {
     .filter((player) => player.id !== gameState.lastPlayedBy)
     .every((player) => player.passed);
   if (!everyoneElsePassed) return false;
-  gameState.phase = "fieldClear";
   addLog("場が流れました");
-  gameState.playedCards.push(...gameState.currentField.cards);
-  gameState.currentField = null;
-  resetPasses();
-  const parent = gameState.players[gameState.lastPlayedBy];
-  if (parent && !parent.finished) {
-    gameState.currentPlayerIndex = parent.id;
-  } else {
-    const next = findNextActivePlayer(gameState.lastPlayedBy);
-    gameState.currentPlayerIndex = next === -1 ? 0 : next;
-  }
-  render();
-  delay(820).then(() => {
-    if (checkRoundEnd()) return;
-    const current = gameState.players[gameState.currentPlayerIndex];
-    gameState.phase = current.isHuman ? "playerTurn" : "cpuTurn";
-    render();
-    if (!current.isHuman) handleCpuTurn();
-  });
+  startFieldClear(gameState.lastPlayedBy, "場流し");
   return true;
 }
 
@@ -420,10 +420,62 @@ function applyMove(player, move) {
   gameState.lastPlayedBy = player.id;
   resetOtherPassesAfterPlay(player.id);
   addLog(`${player.name} が ${formatCards(move.cards)} を出しました`);
+  if (isJBackMove(move)) {
+    gameState.jBack = true;
+    gameState.fieldEffect = "Jバック！";
+    addLog("Jバック発生！");
+  }
   if (player.hand.length === 0) {
     markFinished(player);
   }
+  if (gameState.phase === "roundResult") {
+    validateCardIntegrity("applyMove");
+    return { fieldCleared: false };
+  }
+  if (isEightCutMove(move)) {
+    addLog("八切り！ 場が流れました");
+    startFieldClear(player.id, "八切り！");
+    validateCardIntegrity("applyMove");
+    return { fieldCleared: true };
+  }
   validateCardIntegrity("applyMove");
+  return { fieldCleared: false };
+}
+
+function startFieldClear(parentId, effectText) {
+  const token = gameState.actionToken;
+  if (gameState.currentField) {
+    gameState.playedCards.push(...gameState.currentField.cards);
+  }
+  gameState.currentField = null;
+  gameState.jBack = false;
+  gameState.fieldEffect = effectText;
+  resetPasses();
+  const parent = gameState.players[parentId];
+  if (parent && !parent.finished) {
+    gameState.currentPlayerIndex = parent.id;
+  } else {
+    const next = findNextActivePlayer(parentId);
+    gameState.currentPlayerIndex = next === -1 ? 0 : next;
+  }
+  gameState.phase = "fieldClear";
+  render();
+  delay(900).then(() => {
+    if (token !== gameState.actionToken || checkRoundEnd()) return;
+    const current = gameState.players[gameState.currentPlayerIndex];
+    gameState.fieldEffect = "";
+    gameState.phase = current.isHuman ? "playerTurn" : "cpuTurn";
+    render();
+    if (!current.isHuman) handleCpuTurn();
+  });
+}
+
+function isEightCutMove(move) {
+  return move.value === 8;
+}
+
+function isJBackMove(move) {
+  return move.value === 11;
 }
 
 function resetOtherPassesAfterPlay(playerId) {
@@ -478,16 +530,28 @@ function chooseCpuMove(player, state = gameState) {
 function scoreCpuMove(move, player, state = gameState) {
   const remaining = player.hand.length - move.count;
   const strongestOpponentLow = state.players.some((p) => p.id !== player.id && !p.finished && p.hand.length <= 2);
+  const power = cardPower(move.value);
+  const lowCards = player.hand.filter((card) => card.value <= 5).length;
   let score = 0;
   score += move.count * 24;
-  score -= move.value * 1.4;
+  score -= power * 1.4;
   score -= breaksSetPenalty(move, player) * 12;
-  if (state.currentField) score += (20 - (move.value - state.currentField.value) * 3);
+  if (state.currentField) score += (20 - (power - cardPower(state.currentField.value)) * 3);
   if (remaining === 0) score += 500;
-  if (remaining <= 2) score += 55 - move.value;
+  if (remaining <= 2) score += 55 - power;
   if (strongestOpponentLow && move.value >= 13) score += 28;
   if (!state.currentField && move.count >= 2) score += 22;
-  if (move.value >= 14 && player.hand.length > 5) score -= 32;
+  if (move.value >= 14 && player.hand.length > 5 && !state.jBack) score -= 32;
+  if (move.value === 8) {
+    score += remaining <= 3 ? 70 : -10;
+    if (strongestOpponentLow) score += 55;
+    if (player.hand.length > 7) score -= 22;
+  }
+  if (move.value === 11) {
+    score += lowCards * 8;
+    if (strongestOpponentLow) score += 18;
+    if (state.jBack) score -= 18;
+  }
   return score;
 }
 
@@ -500,7 +564,7 @@ function shouldCpuPass(player, state = gameState, legalMoves = getLegalMoves(pla
   );
   const hasDangerOpponent = state.players.some((p) => p.id !== player.id && !p.finished && p.hand.length <= 2);
   if (hasDangerOpponent) return false;
-  if (best.value >= 14 && player.hand.length > 4) return Math.random() < 0.68;
+  if (cardPower(best.value) >= 14 && player.hand.length > 4) return Math.random() < 0.68;
   return false;
 }
 
@@ -643,15 +707,27 @@ function renderPlayers() {
         <span class="player-name">${player.name}</span>
         <span class="role-badge">${player.role || "平民"}</span>
       </div>
+      ${renderCpuCardStack(player)}
       <div class="seat-info">
-        <span class="status-chip">手札 ${player.hand.length}</span>
+        <span class="status-chip ${player.hand.length <= 2 && !player.finished ? "is-danger" : ""}">手札 ${player.hand.length}</span>
         ${player.passed ? '<span class="status-chip">パス</span>' : ""}
         ${player.finished ? `<span class="status-chip">${player.place}位</span>` : ""}
+        ${gameState.currentPlayerIndex === player.id && ["playerTurn", "cpuTurn"].includes(gameState.phase) ? '<span class="status-chip turn-chip">TURN</span>' : ""}
       </div>
       <div class="seat-info">${player.isHuman ? "あなた" : "CPU"}</div>
     `;
     els.playersArea.appendChild(seat);
   });
+}
+
+function renderCpuCardStack(player) {
+  if (player.isHuman) return '<div class="human-marker">PLAYER</div>';
+  if (player.finished) return '<div class="cpu-stack finished-stack">上がり</div>';
+  const backs = Math.min(7, Math.max(1, Math.ceil(player.hand.length / 2)));
+  const danger = player.hand.length <= 2 ? " danger-stack" : "";
+  return `<div class="cpu-stack${danger}" aria-label="残り${player.hand.length}枚">${
+    Array.from({ length: backs }, (_, index) => `<span style="--i:${index}"></span>`).join("")
+  }<b>${player.hand.length}</b></div>`;
 }
 
 function renderField() {
@@ -661,7 +737,7 @@ function renderField() {
   if (gameState.phase === "fieldClear") els.turnBanner.textContent = "場が流れました";
   if (gameState.phase === "dealing") els.turnBanner.textContent = "カードを配っています";
   if (gameState.phase === "exchange") els.turnBanner.textContent = "カード交換中";
-  els.fieldType.textContent = `場: ${gameState.currentField ? gameState.currentField.label : "なし"}`;
+  els.fieldType.textContent = `場: ${gameState.currentField ? gameState.currentField.label : "なし"}${gameState.jBack ? " / Jバック中" : ""}`;
   els.lastMove.textContent = gameState.currentField
     ? `直前: ${gameState.players[gameState.currentField.playerId].name} ${formatCards(gameState.currentField.cards)}`
     : "直前: なし";
@@ -669,6 +745,8 @@ function renderField() {
   (gameState.currentField?.cards || []).forEach((card) => {
     els.fieldCards.appendChild(cardElement(card));
   });
+  els.fieldEffect.textContent = gameState.fieldEffect || (gameState.jBack ? "Jバック中" : "");
+  els.fieldEffect.classList.toggle("is-active", Boolean(els.fieldEffect.textContent));
 }
 
 function renderHand() {
@@ -747,6 +825,7 @@ function renderExchange() {
 }
 
 function renderDebug() {
+  if (!DEBUG_ENABLED) return;
   const counts = gameState.players.map((p) => `${p.name}:${p.hand.length}`).join(" / ");
   els.debugInfo.textContent = [
     `state: ${gameState.phase}`,
@@ -866,6 +945,8 @@ function finishRound() {
     gameState.playedCards.push(...gameState.currentField.cards);
     gameState.currentField = null;
   }
+  gameState.jBack = false;
+  gameState.fieldEffect = "";
   assignRanks();
   updateStatsAfterRound();
   gameState.phase = "roundResult";
@@ -913,7 +994,7 @@ function playableCardIds(player) {
   }
   const need = gameState.currentField.count;
   groupByValue(player.hand).forEach((group) => {
-    if (group.length >= need && group[0].value > gameState.currentField.value) {
+    if (group.length >= need && cardPower(group[0].value) > cardPower(gameState.currentField.value)) {
       group.forEach((card) => ids.add(card.id));
     }
   });
