@@ -841,7 +841,11 @@ function cardElement(card) {
   div.type = "button";
   div.className = `card ${["♥", "♦"].includes(card.suit) ? "red" : ""}`;
   div.dataset.corner = `${card.rank}${card.suit}`;
-  div.textContent = `${card.rank}${card.suit}`;
+  div.innerHTML = `
+    <span class="card-corner card-corner-top">${card.rank}<small>${card.suit}</small></span>
+    <span class="card-center">${card.suit}</span>
+    <span class="card-corner card-corner-bottom">${card.rank}<small>${card.suit}</small></span>
+  `;
   return div;
 }
 
